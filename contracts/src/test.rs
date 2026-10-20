@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 #[cfg(test)]
 mod tests {
     use soroban_sdk::{
@@ -197,7 +198,7 @@ mod tests {
         assert_eq!(campaign_id, 1);
         let events = env.events().all();
         assert!(
-            !events.is_empty(),
+            !events.events().is_empty(),
             "campaign creation must emit an event"
         );
     }
@@ -227,7 +228,7 @@ mod tests {
         }));
         assert!(result.is_err(), "creation must be rejected");
         assert!(
-            env.events().all().is_empty(),
+            env.events().all().events().is_empty(),
             "failed creation must not emit a success event"
         );
     }
@@ -2905,5 +2906,128 @@ mod tests {
         let client = deploy_contract(&env);
         client.initialize(&admin, &100_i128);
         client.set_fee(&admin, &(-1_i128));
+    }
+
+    // -- Contract configuration events & benchmarks (issues #914, #917) ------
+
+    #[test]
+    fn test_initialize_emits_structured_event() {
+        let env = test_env();
+        env.mock_all_auths();
+        let client = deploy_contract(&env);
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &250_i128);
+
+        let events = env.events().all();
+        assert!(!events.events().is_empty(), "initialize must emit structured event");
+    }
+
+    #[test]
+    fn test_set_paused_emits_structured_event() {
+        let env = test_env();
+        env.mock_all_auths();
+        let client = deploy_contract(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &100_i128);
+
+        client.set_paused(&admin, &true);
+        let events = env.events().all();
+        assert!(!events.events().is_empty(), "set_paused must emit event");
+    }
+
+    #[test]
+    fn test_set_fee_and_recipient_emit_structured_events() {
+        let env = test_env();
+        env.mock_all_auths();
+        let client = deploy_contract(&env);
+        let admin = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.initialize(&admin, &100_i128);
+
+        client.set_fee(&admin, &150_i128);
+        assert_eq!(client.get_platform_fee_bps(), 150_i128);
+
+        client.set_fee_recipient(&admin, &recipient);
+        assert_eq!(client.get_fee_recipient().unwrap(), recipient);
+    }
+
+    #[test]
+    fn test_failed_config_calls_emit_no_event() {
+        let env = test_env();
+        env.mock_all_auths();
+        let client = deploy_contract(&env);
+        let admin = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+        client.initialize(&admin, &100_i128);
+
+        // Unauthorized pause attempt
+        let res_pause = crate::std::panic::catch_unwind(crate::std::panic::AssertUnwindSafe(|| {
+            client.set_paused(&non_admin, &true);
+        }));
+        assert!(res_pause.is_err(), "non-admin pause must fail");
+
+        // Negative fee attempt
+        let res_fee = crate::std::panic::catch_unwind(crate::std::panic::AssertUnwindSafe(|| {
+            client.set_fee(&admin, &(-10_i128));
+        }));
+        assert!(res_fee.is_err(), "negative fee must fail");
+    }
+
+    #[test]
+    fn test_benchmark_contract_configuration_resources() {
+        let env = test_env();
+        env.mock_all_auths();
+        let client = deploy_contract(&env);
+        let admin = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        // Benchmark initialize
+        env.budget().reset_tracker();
+        client.initialize(&admin, &100_i128);
+        let init_cpu = env.budget().cpu_instruction_cost();
+        let init_mem = env.budget().memory_bytes_cost();
+        assert!(init_cpu > 0, "initialize CPU cost must be tracked");
+        assert!(init_mem > 0, "initialize MEM cost must be tracked");
+
+        // Benchmark set_paused(true)
+        env.budget().reset_tracker();
+        client.set_paused(&admin, &true);
+        let pause_cpu = env.budget().cpu_instruction_cost();
+        let pause_mem = env.budget().memory_bytes_cost();
+        assert!(pause_cpu > 0, "pause CPU cost must be tracked");
+        assert!(pause_mem > 0, "pause MEM cost must be tracked");
+
+        // Benchmark set_paused(false)
+        env.budget().reset_tracker();
+        client.set_paused(&admin, &false);
+        let unpause_cpu = env.budget().cpu_instruction_cost();
+        let unpause_mem = env.budget().memory_bytes_cost();
+        assert!(unpause_cpu > 0, "unpause CPU cost must be tracked");
+        assert!(unpause_mem > 0, "unpause MEM cost must be tracked");
+
+        // Benchmark set_fee
+        env.budget().reset_tracker();
+        client.set_fee(&admin, &200_i128);
+        let fee_cpu = env.budget().cpu_instruction_cost();
+        let fee_mem = env.budget().memory_bytes_cost();
+        assert!(fee_cpu > 0, "set_fee CPU cost must be tracked");
+        assert!(fee_mem > 0, "set_fee MEM cost must be tracked");
+
+        // Benchmark set_fee_recipient
+        env.budget().reset_tracker();
+        client.set_fee_recipient(&admin, &recipient);
+        let recip_cpu = env.budget().cpu_instruction_cost();
+        let recip_mem = env.budget().memory_bytes_cost();
+        assert!(recip_cpu > 0, "set_fee_recipient CPU cost must be tracked");
+        assert!(recip_mem > 0, "set_fee_recipient MEM cost must be tracked");
+
+        std::println!("--- BENCHMARK OUTPUT ---");
+        std::println!("initialize: CPU={}, MEM={}", init_cpu, init_mem);
+        std::println!("set_paused(true): CPU={}, MEM={}", pause_cpu, pause_mem);
+        std::println!("set_paused(false): CPU={}, MEM={}", unpause_cpu, unpause_mem);
+        std::println!("set_fee: CPU={}, MEM={}", fee_cpu, fee_mem);
+        std::println!("set_fee_recipient: CPU={}, MEM={}", recip_cpu, recip_mem);
+        std::println!("------------------------");
     }
 }
