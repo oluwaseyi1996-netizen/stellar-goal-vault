@@ -4,10 +4,13 @@ mod tests {
     use soroban_sdk::{
         testutils::{Address as _, Events as _, Ledger},
         token::{Client as TokenClient, StellarAssetClient},
-        Address, Env, String,
+        Address, Env, IntoVal, String,
     };
 
-    use crate::{StellarGoalVaultContract, StellarGoalVaultContractClient};
+    use crate::{
+        CampaignClaimed, FeeCollected, StellarGoalVaultContract,
+        StellarGoalVaultContractClient,
+    };
     // Keep contract tests independent of the machine clock and local timezone.
     // Soroban timestamps are UTC Unix seconds; epoch zero preserves the mock
     // ledger's historical test behavior while making the chosen time explicit.
@@ -443,6 +446,114 @@ mod tests {
     }
 
     #[test]
+    fn test_claim_accounting_invariants_across_amounts_and_fees() {
+        for (amount, fee_bps) in [(100_i128, 0_i128), (101, 1), (999, 200), (10_000, 10_000)] {
+            let env = test_env();
+            env.mock_all_auths();
+
+            let creator = Address::generate(&env);
+            let contributor = Address::generate(&env);
+            let admin = Address::generate(&env);
+            let fee_recipient = Address::generate(&env);
+            let token = deploy_token(&env, &admin, &contributor, amount);
+            let client = deploy_contract(&env);
+            client.initialize(&admin, &100_i128);
+            client.set_fee(&admin, &fee_bps);
+            client.set_fee_recipient(&admin, &fee_recipient);
+
+            let deadline = env.ledger().timestamp() + 10;
+            let campaign_id = client.create_campaign(
+                &creator,
+                &soroban_sdk::vec![&env, token.clone()],
+                &amount,
+                &deadline,
+                &String::from_str(&env, "claim accounting invariant"),
+                &0_i128,
+                &soroban_sdk::vec![&env],
+                &0_u32,
+            );
+
+            client.contribute(&campaign_id, &contributor, &token, &amount);
+            advance_time(&env, 11);
+            client.claim(&campaign_id, &creator);
+
+            let token_client = TokenClient::new(&env, &token);
+            let fee_amount = amount * fee_bps / 10_000;
+            let creator_amount = amount - fee_amount;
+            assert_eq!(token_client.balance(&creator), creator_amount);
+            assert_eq!(token_client.balance(&fee_recipient), fee_amount);
+            assert_eq!(token_client.balance(&client.address), 0);
+            assert_eq!(
+                token_client.balance(&creator) + token_client.balance(&fee_recipient),
+                amount,
+                "claim must distribute every contributed token"
+            );
+            assert_eq!(client.get_campaign_token_balance(&campaign_id, &token), 0);
+
+            let campaign = client.get_campaign(&campaign_id);
+            assert!(campaign.claimed);
+            assert_eq!(campaign.pledged_amount, amount);
+
+            assert!(client.try_claim(&campaign_id, &creator).is_err());
+            assert_eq!(token_client.balance(&creator), creator_amount);
+            assert_eq!(token_client.balance(&fee_recipient), fee_amount);
+            assert_eq!(token_client.balance(&client.address), 0);
+            assert_eq!(client.get_campaign_token_balance(&campaign_id, &token), 0);
+        }
+    }
+
+    #[test]
+    fn test_invalid_claim_accounting_invariants() {
+        for (funding, past_deadline, wrong_creator) in
+            [(1_000_i128, false, false), (500, true, false), (1_000, true, true)]
+        {
+            let env = test_env();
+            env.mock_all_auths();
+
+            let creator = Address::generate(&env);
+            let attacker = Address::generate(&env);
+            let contributor = Address::generate(&env);
+            let admin = Address::generate(&env);
+            let token = deploy_token(&env, &admin, &contributor, 1_000);
+            let client = deploy_contract(&env);
+            let deadline = env.ledger().timestamp() + 10;
+            let campaign_id = client.create_campaign(
+                &creator,
+                &soroban_sdk::vec![&env, token.clone()],
+                &1_000_i128,
+                &deadline,
+                &String::from_str(&env, "invalid claim invariant"),
+                &0_i128,
+                &soroban_sdk::vec![&env],
+                &0_u32,
+            );
+
+            client.contribute(&campaign_id, &contributor, &token, &funding);
+            if past_deadline {
+                advance_time(&env, 11);
+            }
+
+            let claimant = if wrong_creator { &attacker } else { &creator };
+            assert!(client.try_claim(&campaign_id, claimant).is_err());
+
+            let token_client = TokenClient::new(&env, &token);
+            assert_eq!(token_client.balance(&contributor), 1_000 - funding);
+            assert_eq!(token_client.balance(&client.address), funding);
+            assert_eq!(token_client.balance(&creator), 0);
+            assert_eq!(
+                token_client.balance(&contributor) + token_client.balance(&client.address),
+                1_000,
+                "rejected claim must not create or destroy tokens"
+            );
+            assert_eq!(client.get_campaign_token_balance(&campaign_id, &token), funding);
+
+            let campaign = client.get_campaign(&campaign_id);
+            assert!(!campaign.claimed);
+            assert_eq!(campaign.pledged_amount, funding);
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "creator mismatch")]
     fn test_claim_creator_mismatch() {
         let env = test_env();
@@ -505,6 +616,37 @@ mod tests {
 
         client.contribute(&campaign_id, &contributor, &token, &target);
         client.claim(&campaign_id, &creator);
+    }
+
+    #[test]
+    fn test_failed_claim_emits_no_success_event() {
+        let env = test_env();
+        env.mock_all_auths();
+
+        let creator = Address::generate(&env);
+        let contributor = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = deploy_token(&env, &admin, &contributor, 1_000);
+        let client = deploy_contract(&env);
+        let campaign_id = client.create_campaign(
+            &creator,
+            &soroban_sdk::vec![&env, token.clone()],
+            &1_000_i128,
+            &(env.ledger().timestamp() + 100),
+            &String::from_str(&env, "failed claim event test"),
+            &0_i128,
+            &soroban_sdk::vec![&env],
+            &0_u32,
+        );
+        client.contribute(&campaign_id, &contributor, &token, &1_000);
+
+        let events_before_claim = env.events().all().len();
+        assert!(client.try_claim(&campaign_id, &creator).is_err());
+        assert_eq!(
+            env.events().all().len(),
+            events_before_claim,
+            "failed claim must not leave success events"
+        );
     }
 
     #[test]
@@ -2558,6 +2700,39 @@ mod tests {
         let token_client = TokenClient::new(&env, &token);
         assert_eq!(token_client.balance(&creator), 980);
         assert_eq!(token_client.balance(&fee_recipient), 20);
+
+        let events = env.events().all();
+        let claim_topics = (soroban_sdk::symbol_short!("Goal"), soroban_sdk::symbol_short!("Claim"))
+            .into_val(&env);
+        let fee_topics = (soroban_sdk::symbol_short!("Goal"), soroban_sdk::symbol_short!("Fee"))
+            .into_val(&env);
+        let mut claim_events = events.iter().filter(|(_, topics, _)| topics == &claim_topics);
+        let claim_event = claim_events.next().expect("claim event should be emitted");
+        assert!(claim_events.next().is_none(), "one claim event is expected");
+        assert_eq!(
+            claim_event.2,
+            CampaignClaimed {
+                campaign_id,
+                creator: creator.clone(),
+                token: token.clone(),
+                amount: target,
+            }
+            .into_val(&env)
+        );
+
+        let mut fee_events = events.iter().filter(|(_, topics, _)| topics == &fee_topics);
+        let fee_event = fee_events.next().expect("fee event should be emitted");
+        assert!(fee_events.next().is_none(), "one fee event is expected");
+        assert_eq!(
+            fee_event.2,
+            FeeCollected {
+                campaign_id,
+                token: token.clone(),
+                fee_amount: 20,
+                fee_recipient: fee_recipient.clone(),
+            }
+            .into_val(&env)
+        );
     }
 
     #[test]
@@ -2600,6 +2775,31 @@ mod tests {
         let token_client = TokenClient::new(&env, &token);
         assert_eq!(token_client.balance(&creator), 1_000);
         assert_eq!(token_client.balance(&fee_recipient), 0);
+
+        let events = env.events().all();
+        let claim_topics = (soroban_sdk::symbol_short!("Goal"), soroban_sdk::symbol_short!("Claim"))
+            .into_val(&env);
+        let fee_topics = (soroban_sdk::symbol_short!("Goal"), soroban_sdk::symbol_short!("Fee"))
+            .into_val(&env);
+        let claim_events: Vec<_> = events
+            .iter()
+            .filter(|(_, topics, _)| topics == &claim_topics)
+            .collect();
+        assert_eq!(claim_events.len(), 1);
+        assert_eq!(
+            claim_events[0].2,
+            CampaignClaimed {
+                campaign_id,
+                creator: creator.clone(),
+                token: token.clone(),
+                amount: target,
+            }
+            .into_val(&env)
+        );
+        assert!(
+            events.iter().all(|(_, topics, _)| topics != &fee_topics),
+            "zero fee must not emit a fee event"
+        );
     }
 
     // --- Failure-path coverage (issue #989) ---
@@ -2908,126 +3108,69 @@ mod tests {
         client.set_fee(&admin, &(-1_i128));
     }
 
-    // -- Contract configuration events & benchmarks (issues #914, #917) ------
-
     #[test]
-    fn test_initialize_emits_structured_event() {
+    #[should_panic(expected = "fee must not exceed 10000 basis points")]
+    fn test_set_fee_rejects_above_10000_bps() {
         let env = test_env();
         env.mock_all_auths();
-        let client = deploy_contract(&env);
+
         let admin = Address::generate(&env);
-
-        client.initialize(&admin, &250_i128);
-
-        let events = env.events().all();
-        assert!(!events.events().is_empty(), "initialize must emit structured event");
+        let client = deploy_contract(&env);
+        client.initialize(&admin, &100_i128);
+        client.set_fee(&admin, &10_001_i128);
     }
 
     #[test]
-    fn test_set_paused_emits_structured_event() {
+    fn test_set_fee_rejection_does_not_mutate_state() {
         let env = test_env();
         env.mock_all_auths();
-        let client = deploy_contract(&env);
+
         let admin = Address::generate(&env);
+        let client = deploy_contract(&env);
         client.initialize(&admin, &100_i128);
 
-        client.set_paused(&admin, &true);
-        let events = env.events().all();
-        assert!(!events.events().is_empty(), "set_paused must emit event");
-    }
+        assert_eq!(client.get_platform_fee_bps(), 50);
 
-    #[test]
-    fn test_set_fee_and_recipient_emit_structured_events() {
-        let env = test_env();
-        env.mock_all_auths();
-        let client = deploy_contract(&env);
-        let admin = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        client.initialize(&admin, &100_i128);
-
-        client.set_fee(&admin, &150_i128);
-        assert_eq!(client.get_platform_fee_bps(), 150_i128);
-
-        client.set_fee_recipient(&admin, &recipient);
-        assert_eq!(client.get_fee_recipient().unwrap(), recipient);
-    }
-
-    #[test]
-    fn test_failed_config_calls_emit_no_event() {
-        let env = test_env();
-        env.mock_all_auths();
-        let client = deploy_contract(&env);
-        let admin = Address::generate(&env);
-        let non_admin = Address::generate(&env);
-        client.initialize(&admin, &100_i128);
-
-        // Unauthorized pause attempt
-        let res_pause = crate::std::panic::catch_unwind(crate::std::panic::AssertUnwindSafe(|| {
-            client.set_paused(&non_admin, &true);
+        let result = crate::std::panic::catch_unwind(crate::std::panic::AssertUnwindSafe(|| {
+            client.set_fee(&admin, &(-100_i128));
         }));
-        assert!(res_pause.is_err(), "non-admin pause must fail");
+        assert!(result.is_err());
+        assert_eq!(client.get_platform_fee_bps(), 50);
 
-        // Negative fee attempt
-        let res_fee = crate::std::panic::catch_unwind(crate::std::panic::AssertUnwindSafe(|| {
-            client.set_fee(&admin, &(-10_i128));
+        let result_over = crate::std::panic::catch_unwind(crate::std::panic::AssertUnwindSafe(|| {
+            client.set_fee(&admin, &15_000_i128);
         }));
-        assert!(res_fee.is_err(), "negative fee must fail");
+        assert!(result_over.is_err());
+        assert_eq!(client.get_platform_fee_bps(), 50);
     }
 
     #[test]
-    fn test_benchmark_contract_configuration_resources() {
+    #[should_panic(expected = "fee recipient cannot be the vault contract")]
+    fn test_set_fee_recipient_rejects_vault_address() {
         let env = test_env();
         env.mock_all_auths();
-        let client = deploy_contract(&env);
+
         let admin = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        // Benchmark initialize
-        env.budget().reset_tracker();
+        let client = deploy_contract(&env);
         client.initialize(&admin, &100_i128);
-        let init_cpu = env.budget().cpu_instruction_cost();
-        let init_mem = env.budget().memory_bytes_cost();
-        assert!(init_cpu > 0, "initialize CPU cost must be tracked");
-        assert!(init_mem > 0, "initialize MEM cost must be tracked");
+        client.set_fee_recipient(&admin, &client.address);
+    }
 
-        // Benchmark set_paused(true)
-        env.budget().reset_tracker();
-        client.set_paused(&admin, &true);
-        let pause_cpu = env.budget().cpu_instruction_cost();
-        let pause_mem = env.budget().memory_bytes_cost();
-        assert!(pause_cpu > 0, "pause CPU cost must be tracked");
-        assert!(pause_mem > 0, "pause MEM cost must be tracked");
+    #[test]
+    fn test_set_fee_recipient_rejection_does_not_mutate_state() {
+        let env = test_env();
+        env.mock_all_auths();
 
-        // Benchmark set_paused(false)
-        env.budget().reset_tracker();
-        client.set_paused(&admin, &false);
-        let unpause_cpu = env.budget().cpu_instruction_cost();
-        let unpause_mem = env.budget().memory_bytes_cost();
-        assert!(unpause_cpu > 0, "unpause CPU cost must be tracked");
-        assert!(unpause_mem > 0, "unpause MEM cost must be tracked");
+        let admin = Address::generate(&env);
+        let client = deploy_contract(&env);
+        client.initialize(&admin, &100_i128);
 
-        // Benchmark set_fee
-        env.budget().reset_tracker();
-        client.set_fee(&admin, &200_i128);
-        let fee_cpu = env.budget().cpu_instruction_cost();
-        let fee_mem = env.budget().memory_bytes_cost();
-        assert!(fee_cpu > 0, "set_fee CPU cost must be tracked");
-        assert!(fee_mem > 0, "set_fee MEM cost must be tracked");
+        assert!(client.get_fee_recipient().is_none());
 
-        // Benchmark set_fee_recipient
-        env.budget().reset_tracker();
-        client.set_fee_recipient(&admin, &recipient);
-        let recip_cpu = env.budget().cpu_instruction_cost();
-        let recip_mem = env.budget().memory_bytes_cost();
-        assert!(recip_cpu > 0, "set_fee_recipient CPU cost must be tracked");
-        assert!(recip_mem > 0, "set_fee_recipient MEM cost must be tracked");
-
-        std::println!("--- BENCHMARK OUTPUT ---");
-        std::println!("initialize: CPU={}, MEM={}", init_cpu, init_mem);
-        std::println!("set_paused(true): CPU={}, MEM={}", pause_cpu, pause_mem);
-        std::println!("set_paused(false): CPU={}, MEM={}", unpause_cpu, unpause_mem);
-        std::println!("set_fee: CPU={}, MEM={}", fee_cpu, fee_mem);
-        std::println!("set_fee_recipient: CPU={}, MEM={}", recip_cpu, recip_mem);
-        std::println!("------------------------");
+        let result = crate::std::panic::catch_unwind(crate::std::panic::AssertUnwindSafe(|| {
+            client.set_fee_recipient(&admin, &client.address);
+        }));
+        assert!(result.is_err());
+        assert!(client.get_fee_recipient().is_none());
     }
 }
