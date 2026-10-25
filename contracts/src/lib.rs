@@ -441,6 +441,11 @@ impl StellarGoalVaultContract {
         if bps > 10000 {
             panic!("fee must not exceed 10000 basis points");
         }
+        let old_fee_bps = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFeeBps)
+            .unwrap_or(DEFAULT_PLATFORM_FEE_BPS);
         env.storage().instance().set(&DataKey::PlatformFeeBps, &bps);
 
         env.events().publish(
